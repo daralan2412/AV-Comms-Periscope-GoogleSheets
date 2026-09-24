@@ -6,8 +6,11 @@
  *
  * Source:  Sisense/Periscope shared report "Springshot Comms Counts" (Avianca BOG)
  *          https://app.periscopedata.com/shared/ecc51857-da20-40f2-8917-3c2b68fd34e8
- * Target:  spreadsheet "2026_AV_Comms" (SPREADSHEET_ID), tab "Data", 8 columns
- *          (HEADERS). Column A = team_mission_comment_id = the dedupe key.
+ * Target:  ONE SPREADSHEET PER MONTH (v3), tab "Data", 8 columns (HEADERS).
+ *          July 2026 = the original "2026_AV_Comms" (SPREADSHEET_ID); other
+ *          months = "<M>_<YYYY>_AV_Comms" in the same Drive folder, created on
+ *          first use. Column A = team_mission_comment_id = the dedupe key;
+ *          column G = created_date decides the file.
  *
  * Contract with the scraper (scrape_and_upload.py):
  *   GET  ?token=...                          -> {success:true} health check
@@ -33,30 +36,47 @@
  * Deploy > Manage deployments > Edit > Version: New version.
  */
 
-var SPREADSHEET_ID = '1Nd_-ux8WkyifEXbxuTBoyUNL0E-wRbJ5JorgTDfza-0';
+var SPREADSHEET_ID = '1Nd_-ux8WkyifEXbxuTBoyUNL0E-wRbJ5JorgTDfza-0'; // 2026_AV_Comms = the JULY 2026 file
+var HOME_MONTH = '7_2026';         // month held by SPREADSHEET_ID
+var FILE_SUFFIX = '_AV_Comms';     // other months: "<M>_<YYYY>_AV_Comms" (8_2026_AV_Comms, ...)
 var SHEET_NAME = 'Data';
 var ID_COL = 1;                    // column A = team_mission_comment_id
+var DATE_COL = 7;                  // column G = created_date (routes the row)
 var TEXT_COLS = [4, 5, 6, 8];      // owner, job_type, comment, metadata
 var HEADERS = [
   'team_mission_comment_id', 'inbound_number', 'outbound_number', 'owner',
   'job_type', 'comment', 'created_date', 'metadata'
 ];
 
+// v3 (2026-09-24): ONE FILE PER MONTH. A single spreadsheet is capped at 10M
+// cells; July alone is ~490k rows. Each row goes to the file of its own
+// created_date month: July -> 2026_AV_Comms (the original file), any other
+// month -> "<M>_<YYYY>_AV_Comms" in the same Drive folder, created on first
+// use. Rows sitting in the wrong month's file are deleted by the cleanup.
+
+// GET ?token=...                                   -> health check (all month files)
+// GET ?token=...&action=rebuild&month=9_2026       -> dedupe + wrong-month cleanup of one file
 function doGet(e) {
   if (!checkToken_(e)) return jsonOut_({ success: false, error: 'unauthorized' });
   try {
-    var sheet = getSheet_();
     if ((e.parameter.action || '') === 'rebuild') {
+      var ym = e.parameter.month || HOME_MONTH;
       var lock = LockService.getScriptLock();
       if (!lock.tryLock(120000)) return jsonOut_({ success: false, error: 'another upload is in progress (lock timeout)' });
       try {
-        return jsonOut_({ success: true, action: 'rebuild', result: dedupeSheet_(sheet) });
+        var sh = findMonthSheet_(ym);
+        if (!sh) return jsonOut_({ success: false, error: 'no file for ' + ym });
+        return jsonOut_({ success: true, action: 'rebuild', month: ym, result: cleanupSheet_(sh, ym) });
       } finally {
         lock.releaseLock();
       }
     }
-    return jsonOut_({ success: true, message: 'ok', sheet: sheet.getParent().getName() + ' / ' + sheet.getName(),
-                      rows: Math.max(sheet.getLastRow() - 1, 0) });
+    var files = {}, total = 0;
+    listMonthFiles_().forEach(function (f) {
+      var n = Math.max(f.sheet.getLastRow() - 1, 0);
+      files[f.name] = n; total += n;
+    });
+    return jsonOut_({ success: true, message: 'ok', rows: total, files: files });
   } catch (err) {
     return jsonOut_({ success: false, error: 'doGet failed: ' + err });
   }
@@ -79,16 +99,31 @@ function doPost(e) {
     return jsonOut_({ success: false, error: 'another upload is in progress (lock timeout)' });
   }
   try {
-    var sheet = getSheet_();
-    var u = upsertRows_(sheet, rows);
-    var d = dedupeSheet_(sheet);
+    var groups = {}, unroutable = 0;
+    rows.forEach(function (row) {
+      var ym = monthKey_(row[DATE_COL - 1], null);
+      if (!ym) { unroutable++; return; }
+      (groups[ym] = groups[ym] || []).push(row);
+    });
+    var perFile = {}, upd = 0, app = 0, dup = 0, wrong = 0, total = 0;
+    Object.keys(groups).forEach(function (ym) {
+      var sheet = getOrCreateMonthSheet_(ym);
+      var u = upsertRows_(sheet, groups[ym]);
+      var c = cleanupSheet_(sheet, ym);
+      perFile[fileLabel_(ym)] = { received: groups[ym].length, updated: u.updated, appended: u.appended,
+                                  duplicates_removed: c.duplicates, wrong_month_removed: c.wrongMonth, total_rows: c.total };
+      upd += u.updated; app += u.appended; dup += c.duplicates; wrong += c.wrongMonth; total += c.total;
+    });
     return jsonOut_({
       success: true,
       rows_received: rows.length,
-      rows_updated: u.updated,
-      rows_appended: u.appended,
-      duplicates_removed: d.duplicates,
-      total_rows: d.total
+      rows_unroutable: unroutable,
+      rows_updated: upd,
+      rows_appended: app,
+      duplicates_removed: dup,
+      wrong_month_removed: wrong,
+      total_rows: total,
+      files: perFile
     });
   } catch (err) {
     return jsonOut_({ success: false, error: 'doPost failed: ' + err });
@@ -98,16 +133,85 @@ function doPost(e) {
 }
 
 // ---------------------------------------------------------------------------
+// Month routing
+// ---------------------------------------------------------------------------
 
-function getSheet_() {
-  var ss = SpreadsheetApp.openById(SPREADSHEET_ID);
-  var sheet = ss.getSheetByName(SHEET_NAME);
-  if (!sheet) throw new Error('tab "' + SHEET_NAME + '" not found');
+// "9_2026" from a created_date cell: ISO text "2026-09-24 13:05:00[.123]"
+// (what Periscope exports) or a Date (what Sheets turns it into).
+function monthKey_(v, tz) {
+  if (v === null || v === undefined || v === '') return null;
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v)) {
+    tz = tz || 'America/Bogota';
+    return Number(Utilities.formatDate(v, tz, 'M')) + '_' + Utilities.formatDate(v, tz, 'yyyy');
+  }
+  var m = String(v).trim().match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+  if (m) return parseInt(m[2], 10) + '_' + m[1];
+  m = String(v).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);   // MM/DD/YYYY fallback
+  if (m) return parseInt(m[1], 10) + '_' + m[3];
+  return null;
+}
+
+function fileLabel_(ym) {
+  return ym === HOME_MONTH ? '2026_AV_Comms (' + ym + ')' : ym + FILE_SUFFIX;
+}
+
+function homeFolder_() {
+  return DriveApp.getFileById(SPREADSHEET_ID).getParents().next();
+}
+
+function dataSheet_(ss) {
+  var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
     sheet.setFrozenRows(1);
   }
   return sheet;
+}
+
+function findMonthSheet_(ym) {
+  if (ym === HOME_MONTH) return dataSheet_(SpreadsheetApp.openById(SPREADSHEET_ID));
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty('FILE_' + ym);
+  if (id) {
+    try { return dataSheet_(SpreadsheetApp.openById(id)); } catch (err) { props.deleteProperty('FILE_' + ym); }
+  }
+  var it = homeFolder_().getFilesByName(ym + FILE_SUFFIX);
+  while (it.hasNext()) {
+    var f = it.next();
+    if (f.getMimeType() === MimeType.GOOGLE_SHEETS && !f.isTrashed()) {
+      props.setProperty('FILE_' + ym, f.getId());
+      return dataSheet_(SpreadsheetApp.openById(f.getId()));
+    }
+  }
+  return null;
+}
+
+function getOrCreateMonthSheet_(ym) {
+  var existing = findMonthSheet_(ym);
+  if (existing) return existing;
+  var ss = SpreadsheetApp.create(ym + FILE_SUFFIX, 1000, HEADERS.length); // only 8 columns: cells are the scarce resource
+  ss.setSpreadsheetTimeZone('America/Bogota');
+  var file = DriveApp.getFileById(ss.getId());
+  file.moveTo(homeFolder_());
+  var sheet = ss.getSheets()[0];
+  sheet.setName(SHEET_NAME);
+  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
+  sheet.setFrozenRows(1);
+  PropertiesService.getScriptProperties().setProperty('FILE_' + ym, ss.getId());
+  return sheet;
+}
+
+function listMonthFiles_() {
+  var out = [{ name: fileLabel_(HOME_MONTH), sheet: findMonthSheet_(HOME_MONTH) }];
+  var it = homeFolder_().getFiles();
+  while (it.hasNext()) {
+    var f = it.next();
+    var m = f.getName().match(/^(\d{1,2})_(\d{4})_AV_Comms$/);
+    if (m && f.getMimeType() === MimeType.GOOGLE_SHEETS && !f.isTrashed()) {
+      out.push({ name: f.getName(), sheet: dataSheet_(SpreadsheetApp.openById(f.getId())) });
+    }
+  }
+  return out;
 }
 
 function upsertRows_(sheet, batch) {
@@ -181,32 +285,42 @@ function setTextFormat_(sheet, startRow, numRows) {
   });
 }
 
-// Reads column A only. Returns without writing when there is nothing to do
-// (the normal case, since doPost upserts).
-function dedupeSheet_(sheet) {
+// Cleanup: delete rows whose created_date belongs to another month (they
+// live in that month's file) and collapse stray duplicate ids (last wins).
+// Reads columns A and G only; writes nothing when there is nothing to remove.
+function cleanupSheet_(sheet, ym) {
   var lastRow = sheet.getLastRow();
-  if (lastRow < 2) return { duplicates: 0, total: 0 };
+  if (lastRow < 2) return { duplicates: 0, wrongMonth: 0, total: 0 };
+  var tz = sheet.getParent().getSpreadsheetTimeZone();
   var ids = sheet.getRange(2, ID_COL, lastRow - 1, 1).getValues();
+  var dates = sheet.getRange(2, DATE_COL, lastRow - 1, 1).getValues();
 
+  var wrong = {}, wrongMonth = 0;
+  for (var w = 0; w < dates.length; w++) {
+    var k = monthKey_(dates[w][0], tz);
+    if (k && k !== ym) { wrong[w] = true; wrongMonth++; }
+  }
   var lastIndexById = {};
   for (var j = 0; j < ids.length; j++) {
+    if (wrong[j]) continue;
     var id = String(ids[j][0]).trim();
     if (id) lastIndexById[id] = j;
   }
-  var toDelete = [];
+  var toDelete = [], duplicates = 0;
   for (var i = 0; i < ids.length; i++) {
+    if (wrong[i]) { toDelete.push(i); continue; }
     var idI = String(ids[i][0]).trim();
-    if (idI && lastIndexById[idI] !== i) toDelete.push(i);
+    if (idI && lastIndexById[idI] !== i) { toDelete.push(i); duplicates++; }
   }
   var total = ids.length - toDelete.length;
-  if (toDelete.length === 0) return { duplicates: 0, total: total };
+  if (toDelete.length === 0) return { duplicates: 0, wrongMonth: 0, total: total };
 
   var blocks = [];
-  for (var k = 0; k < toDelete.length; k++) {
-    if (blocks.length && toDelete[k] === blocks[blocks.length - 1].end + 1) {
-      blocks[blocks.length - 1].end = toDelete[k];
+  for (var q = 0; q < toDelete.length; q++) {
+    if (blocks.length && toDelete[q] === blocks[blocks.length - 1].end + 1) {
+      blocks[blocks.length - 1].end = toDelete[q];
     } else {
-      blocks.push({ start: toDelete[k], end: toDelete[k] });
+      blocks.push({ start: toDelete[q], end: toDelete[q] });
     }
   }
   if (blocks.length <= 50) {
@@ -226,7 +340,7 @@ function dedupeSheet_(sheet) {
       sheet.getRange(2, 1, kept.length, lastCol).setValues(kept);
     }
   }
-  return { duplicates: toDelete.length, total: total };
+  return { duplicates: duplicates, wrongMonth: wrongMonth, total: total };
 }
 
 function normalizeWidth_(row) {
@@ -245,9 +359,10 @@ function jsonOut_(obj) {
   return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
 }
 
-// Run once from the editor to grant the Sheets scope and check access.
+// Run once from the editor to grant the Sheets + Drive scopes and check access.
 function debugCheck() {
-  var sheet = getSheet_();
-  Logger.log(sheet.getParent().getName() + ' / ' + sheet.getName() + ': ' + (sheet.getLastRow() - 1) +
-             ' data rows, header: ' + sheet.getRange(1, 1, 1, HEADERS.length).getValues()[0].join(', '));
+  listMonthFiles_().forEach(function (f) {
+    Logger.log(f.name + ': ' + (f.sheet.getLastRow() - 1) + ' data rows');
+  });
+  Logger.log('folder: ' + homeFolder_().getName());
 }
