@@ -70,7 +70,7 @@ LOCAL_TZ = ZoneInfo("America/Bogota")  # BOG station time; UTC-5 all year (no DS
 # made at 20:00 Bogota is already "tomorrow" in UTC, and the next day's first
 # run (00:07, window D-1..D0) still includes it.
 LOOKBACK_DAYS = 1
-BACKFILL_CHUNK_DAYS = 2  # manual catch-up pieces (~15k rows/day on this report)
+BACKFILL_CHUNK_DAYS = 1  # one day per pull: the widget caps display at 20k rows and a day is ~15k
 WIDGET_TIMEOUT_S = 420  # post-Apply query wait (~50 s live on 2026-09-24)
 SCRAPE_ATTEMPTS = 3  # whole-scrape retries with a fresh browser (see scrape_with_retry()).
 SCRAPE_RETRY_DELAY_S = 60
@@ -167,13 +167,19 @@ def _fmt(d):
 def compute_windows():
     """All (label, start, end) windows this run must pull, primary first.
 
-    - primary: D-LOOKBACK_DAYS..D0 in America/Bogota, computed at run time,
-      so a cron that GitHub starts late still pulls the right days.
+    - primary: D-LOOKBACK_DAYS..D0 in America/Bogota, one single-day window
+      per day, computed at run time (a late cron still pulls the right days).
     - manual backfill: BACKFILL_START/BACKFILL_END if both set, cut into
       BACKFILL_CHUNK_DAYS pieces.
     """
     today = datetime.now(LOCAL_TZ).date()
-    windows = [("primary D-%d..D0" % LOOKBACK_DAYS, _fmt(today - timedelta(days=LOOKBACK_DAYS)), _fmt(today))]
+    # One window PER DAY: the Raw Data widget refuses to render more than
+    # 20,000 rows ("Result set too large ... 5MB"), and one BOG day is ~15k
+    # comments, so a 2-day window never renders (run #3, 2026-09-24).
+    windows = [
+        ("primary D-%d" % k, _fmt(today - timedelta(days=k)), _fmt(today - timedelta(days=k)))
+        for k in range(LOOKBACK_DAYS, -1, -1)
+    ]
 
     bf_start, bf_end = os.environ.get("BACKFILL_START", "").strip(), os.environ.get("BACKFILL_END", "").strip()
     if bf_start and bf_end:
@@ -404,7 +410,8 @@ def scrape_window_csv(start_str, end_str):
             last_print = 0
             while True:
                 st = widget_handle.evaluate(state_js)
-                if not st["loader"] and (st["err"] or st["grid"]):
+                too_large = "Result set too large" in st["text"]
+                if not st["loader"] and (st["err"] or st["grid"] or too_large):
                     print(f"  widget settled after {time.time() - t0:.0f}s: {st}", flush=True)
                     break
                 waited = time.time() - t0
@@ -423,6 +430,16 @@ def scrape_window_csv(start_str, end_str):
             if widget.locator(".error-message", has_text="no matching rows").is_visible():
                 browser.close()
                 return None
+
+            # "Result set too large. Data displayed in web browser is limited
+            # to 5MB, please select fewer than 20,000 rows." (seen in run #3,
+            # 2026-09-24, for a 2-day window ~31k rows). That is only the
+            # browser DISPLAY limit - the grid is not rendered, but the
+            # widget's Download Data export is generated server-side, so we
+            # still try it. Windows are also kept to ONE day (see
+            # compute_windows) so this should be rare.
+            if too_large:
+                print("  widget says 'Result set too large' for display; trying the CSV export anyway", flush=True)
 
             # Open the per-widget menu.
             widget.hover()
