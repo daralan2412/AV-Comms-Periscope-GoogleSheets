@@ -6,7 +6,7 @@
  *
  * Source:  Sisense/Periscope shared report "Springshot Comms Counts" (Avianca BOG)
  *          https://app.periscopedata.com/shared/ecc51857-da20-40f2-8917-3c2b68fd34e8
- * Target:  ONE SPREADSHEET PER MONTH (v3), tab "Data", 8 columns (HEADERS).
+ * Target:  ONE SPREADSHEET PER MONTH (v3.1, see MONTH_FILES), tab "Data", 8 columns (HEADERS).
  *          July 2026 = the original "2026_AV_Comms" (SPREADSHEET_ID); other
  *          months = "<M>_<YYYY>_AV_Comms" in the same Drive folder, created on
  *          first use. Column A = team_mission_comment_id = the dedupe key;
@@ -151,67 +151,65 @@ function monthKey_(v, tz) {
   return null;
 }
 
+// v3.1: NO DriveApp. The Drive scope was not granted, so month files are
+// pre-created in the 2026_AV_Comms folder and listed here; SpreadsheetApp
+// (already authorized) is all that is needed to open them. A month that is
+// not listed is created with SpreadsheetApp.create (it lands in My Drive
+// root - move it next to the others) and remembered in Script Properties.
+var MONTH_FILES = {
+  '7_2026': '1Nd_-ux8WkyifEXbxuTBoyUNL0E-wRbJ5JorgTDfza-0', // 2026_AV_Comms
+  '8_2026': '1-Y5OA_LoQ_4CeeEvB3zgYtsJvlc8FsCkt-VGXDn7dYk', // 8_2026_AV_Comms
+  '9_2026': '1GyE2jBn-KsJhFCyTVgi0-TVio_TLJjCMTHDyJZJjk6s'  // 9_2026_AV_Comms
+};
+
 function fileLabel_(ym) {
   return ym === HOME_MONTH ? '2026_AV_Comms (' + ym + ')' : ym + FILE_SUFFIX;
 }
 
-function homeFolder_() {
-  return DriveApp.getFileById(SPREADSHEET_ID).getParents().next();
+function monthFileId_(ym) {
+  return MONTH_FILES[ym] || PropertiesService.getScriptProperties().getProperty('FILE_' + ym);
 }
 
-function dataSheet_(ss) {
+// Returns the data tab. Month files other than July are trimmed to the 8
+// data columns on first use: Google counts EMPTY columns against the 10M
+// cell cap (a default 26-column grid would triple the cost of every row).
+function dataSheet_(ss, ym) {
   var sheet = ss.getSheetByName(SHEET_NAME) || ss.getSheets()[0];
+  if (ym !== HOME_MONTH) {
+    if (sheet.getName() !== SHEET_NAME) sheet.setName(SHEET_NAME);
+    if (sheet.getMaxColumns() > HEADERS.length) {
+      sheet.deleteColumns(HEADERS.length + 1, sheet.getMaxColumns() - HEADERS.length);
+    }
+    if (ss.getSpreadsheetTimeZone() !== 'America/Bogota') ss.setSpreadsheetTimeZone('America/Bogota');
+  }
   if (sheet.getLastRow() === 0) {
     sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-    sheet.setFrozenRows(1);
   }
+  if (sheet.getFrozenRows() !== 1) sheet.setFrozenRows(1);
   return sheet;
 }
 
 function findMonthSheet_(ym) {
-  if (ym === HOME_MONTH) return dataSheet_(SpreadsheetApp.openById(SPREADSHEET_ID));
-  var props = PropertiesService.getScriptProperties();
-  var id = props.getProperty('FILE_' + ym);
-  if (id) {
-    try { return dataSheet_(SpreadsheetApp.openById(id)); } catch (err) { props.deleteProperty('FILE_' + ym); }
-  }
-  var it = homeFolder_().getFilesByName(ym + FILE_SUFFIX);
-  while (it.hasNext()) {
-    var f = it.next();
-    if (f.getMimeType() === MimeType.GOOGLE_SHEETS && !f.isTrashed()) {
-      props.setProperty('FILE_' + ym, f.getId());
-      return dataSheet_(SpreadsheetApp.openById(f.getId()));
-    }
-  }
-  return null;
+  var id = monthFileId_(ym);
+  return id ? dataSheet_(SpreadsheetApp.openById(id), ym) : null;
 }
 
 function getOrCreateMonthSheet_(ym) {
   var existing = findMonthSheet_(ym);
   if (existing) return existing;
-  var ss = SpreadsheetApp.create(ym + FILE_SUFFIX, 1000, HEADERS.length); // only 8 columns: cells are the scarce resource
-  ss.setSpreadsheetTimeZone('America/Bogota');
-  var file = DriveApp.getFileById(ss.getId());
-  file.moveTo(homeFolder_());
-  var sheet = ss.getSheets()[0];
-  sheet.setName(SHEET_NAME);
-  sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS]);
-  sheet.setFrozenRows(1);
+  var ss = SpreadsheetApp.create(ym + FILE_SUFFIX, 1000, HEADERS.length);
   PropertiesService.getScriptProperties().setProperty('FILE_' + ym, ss.getId());
-  return sheet;
+  return dataSheet_(ss, ym);
 }
 
 function listMonthFiles_() {
-  var out = [{ name: fileLabel_(HOME_MONTH), sheet: findMonthSheet_(HOME_MONTH) }];
-  var it = homeFolder_().getFiles();
-  while (it.hasNext()) {
-    var f = it.next();
-    var m = f.getName().match(/^(\d{1,2})_(\d{4})_AV_Comms$/);
-    if (m && f.getMimeType() === MimeType.GOOGLE_SHEETS && !f.isTrashed()) {
-      out.push({ name: f.getName(), sheet: dataSheet_(SpreadsheetApp.openById(f.getId())) });
-    }
-  }
-  return out;
+  var keys = Object.keys(MONTH_FILES);
+  var props = PropertiesService.getScriptProperties().getProperties();
+  Object.keys(props).forEach(function (k) {
+    var m = k.match(/^FILE_(\d{1,2}_\d{4})$/);
+    if (m && keys.indexOf(m[1]) < 0) keys.push(m[1]);
+  });
+  return keys.map(function (ym) { return { name: fileLabel_(ym), sheet: findMonthSheet_(ym) }; });
 }
 
 function upsertRows_(sheet, batch) {
@@ -364,5 +362,4 @@ function debugCheck() {
   listMonthFiles_().forEach(function (f) {
     Logger.log(f.name + ': ' + (f.sheet.getLastRow() - 1) + ' data rows');
   });
-  Logger.log('folder: ' + homeFolder_().getName());
 }
