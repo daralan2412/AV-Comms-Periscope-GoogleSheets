@@ -71,6 +71,7 @@ LOCAL_TZ = ZoneInfo("America/Bogota")  # BOG station time; UTC-5 all year (no DS
 # run (00:07, window D-1..D0) still includes it.
 LOOKBACK_DAYS = 1
 BACKFILL_CHUNK_DAYS = 2  # manual catch-up pieces (~15k rows/day on this report)
+WIDGET_TIMEOUT_S = 420  # post-Apply query wait (~50 s live on 2026-09-24)
 SCRAPE_ATTEMPTS = 3  # whole-scrape retries with a fresh browser (see scrape_with_retry()).
 SCRAPE_RETRY_DELAY_S = 60
 WEBAPP_URL = os.environ["SHEETS_WEBAPP_URL"]
@@ -385,24 +386,34 @@ def scrape_window_csv(start_str, end_str):
             # reported "no rows" for a range that actually had data. Must
             # check visibility, not just presence.
             widget_handle = widget.element_handle()
-            page.wait_for_function(
-                """(el) => {
-                    const loader = el.querySelector('.widget-loader');
-                    if (loader && loader.offsetParent !== null) return false;
-                    const err = el.querySelector('.error-message');
-                    const errVisible = !!err && err.offsetParent !== null;
-                    const grid = el.querySelector('.ninja-grid');
-                    return errVisible || !!grid;
-                }""",
-                arg=widget_handle,
-                # Generous: on the scheduled 7am/7pm runs Sisense has been
-                # measurably slower than during ad-hoc manual runs (see
-                # the ".ninja-grid" note near page.goto above), and this
-                # query may also be queued behind the still-in-flight
-                # default "All Dates" query the page fired on load.
-                # 300s: ~15k comments/day makes this a heavy query.
-                timeout=300_000,
-            )
+            # Poll from Python (not wait_for_function) so the log shows the
+            # widget's state every 30 s and a timeout says WHY it timed out
+            # (run #1 of this repo only reported "Timeout 300000ms exceeded").
+            state_js = """(el) => {
+                const vis = (e) => !!e && e.offsetParent !== null;
+                const loader = el.querySelector('.widget-loader');
+                const err = el.querySelector('.error-message');
+                return {
+                    loader: vis(loader),
+                    err: vis(err),
+                    grid: !!el.querySelector('.ninja-grid'),
+                    text: (el.innerText || '').replace(/\\s+/g, ' ').slice(0, 160),
+                };
+            }"""
+            t0 = time.time()
+            last_print = 0
+            while True:
+                st = widget_handle.evaluate(state_js)
+                if not st["loader"] and (st["err"] or st["grid"]):
+                    print(f"  widget settled after {time.time() - t0:.0f}s: {st}", flush=True)
+                    break
+                waited = time.time() - t0
+                if waited - last_print >= 30:
+                    print(f"  waiting for widget ({waited:.0f}s): {st}", flush=True)
+                    last_print = waited
+                if waited > WIDGET_TIMEOUT_S:
+                    raise RuntimeError(f"Raw Data widget never settled in {WIDGET_TIMEOUT_S}s; last state {st}")
+                page.wait_for_timeout(1000)
 
             # No rows in this date range - Sisense shows this in place of
             # the grid and doesn't offer a "Download Data" menu item at
