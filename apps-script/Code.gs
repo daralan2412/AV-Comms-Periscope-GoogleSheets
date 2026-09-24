@@ -135,20 +135,26 @@ function upsertRows_(sheet, batch) {
     appendsById[id] = row;
   });
 
-  // In-place updates: the CSV export is not guaranteed to come back in the
-  // same order as the rows were appended, so instead of one setValues() per
-  // row, read the smallest block that spans every row to update, patch it
-  // in memory and write it back once. For D-1..D0 that block is the last
-  // ~30k rows of the tab.
-  var rowNums = Object.keys(updates).map(Number);
+  // In-place updates. The CSV export is not in sheet order, so one
+  // setValues() per row would be far too slow. Instead the rows to update
+  // are grouped into clusters (a gap of up to CLUSTER_GAP untouched rows is
+  // absorbed), and each cluster is read, patched in memory and written back
+  // once. Clustering (v2, 2026-09-24) matters once backfilled days sit
+  // between today's rows: a single min..max span would rewrite the whole tab.
+  var rowNums = Object.keys(updates).map(Number).sort(function (a, b) { return a - b; });
   var updated = rowNums.length;
-  if (updated > 0) {
-    var lo = Math.min.apply(null, rowNums), hi = Math.max.apply(null, rowNums);
+  var CLUSTER_GAP = 2000;
+  var c0 = 0;
+  while (c0 < rowNums.length) {
+    var c1 = c0;
+    while (c1 + 1 < rowNums.length && rowNums[c1 + 1] - rowNums[c1] <= CLUSTER_GAP) c1++;
+    var lo = rowNums[c0], hi = rowNums[c1];
     var span = sheet.getRange(lo, 1, hi - lo + 1, HEADERS.length);
     var data = span.getValues();
-    rowNums.forEach(function (r) { data[r - lo] = updates[r]; });
+    for (var k = c0; k <= c1; k++) data[rowNums[k] - lo] = updates[rowNums[k]];
     setTextFormat_(sheet, lo, hi - lo + 1);
     span.setValues(data);
+    c0 = c1 + 1;
   }
 
   // Appends, in created_date order (ISO text sorts chronologically).
