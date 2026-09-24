@@ -543,8 +543,11 @@ def print_result(result):
         f"Posted {result.get('rows_received')} rows: "
         f"{result.get('rows_updated')} updated in place, {result.get('rows_appended')} appended; "
         f"{result.get('duplicates_removed')} stray duplicate row(s) removed; "
-        f"{result.get('total_rows')} data rows in the tab now."
+        f"{result.get('wrong_month_removed', 0)} wrong-month row(s) removed; "
+        f"{result.get('total_rows')} data rows in the touched month file(s)."
     )
+    for name, stats in sorted((result.get("files") or {}).items()):
+        print(f"  {name}: {stats}")
 
 
 def main():
