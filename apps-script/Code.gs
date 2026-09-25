@@ -157,9 +157,18 @@ function monthKey_(v, tz) {
 // not listed is created with SpreadsheetApp.create (it lands in My Drive
 // root - move it next to the others) and remembered in Script Properties.
 var MONTH_FILES = {
-  '7_2026': '1Nd_-ux8WkyifEXbxuTBoyUNL0E-wRbJ5JorgTDfza-0', // 2026_AV_Comms
-  '8_2026': '1-Y5OA_LoQ_4CeeEvB3zgYtsJvlc8FsCkt-VGXDn7dYk', // 8_2026_AV_Comms
-  '9_2026': '1GyE2jBn-KsJhFCyTVgi0-TVio_TLJjCMTHDyJZJjk6s'  // 9_2026_AV_Comms
+  '1_2026':  '1QkXGSIIrXaZ40OQBE7Z7aOwVXtcGhBU5Q5h2NMTe9yk', // 1_2026_AV_Comms
+  '2_2026':  '17dF124-LatQV7H2WUaSL9QDGYS-iwJLbi356KVal8qk', // 2_2026_AV_Comms
+  '3_2026':  '1pFk55gPIPiXfkakgjooQDp7LYkxibYUpw4i0HwUO4oM', // 3_2026_AV_Comms
+  '4_2026':  '1IPe3Sn9vuZiWWlPK_y2YzKG8tKrZyEdhMH_dDh0UyAM', // 4_2026_AV_Comms
+  '5_2026':  '1xkjMhOPT6bP1Nftj6XqNgzbJ8jeMIThLVxrelKmKHuE', // 5_2026_AV_Comms
+  '6_2026':  '14LbT32TRUaIZY6XL2ByAZEkNlSU8RY1bUOs-rN5aVUo', // 6_2026_AV_Comms
+  '7_2026':  '1Nd_-ux8WkyifEXbxuTBoyUNL0E-wRbJ5JorgTDfza-0', // 2026_AV_Comms (July)
+  '8_2026':  '1-Y5OA_LoQ_4CeeEvB3zgYtsJvlc8FsCkt-VGXDn7dYk', // 8_2026_AV_Comms
+  '9_2026':  '1GyE2jBn-KsJhFCyTVgi0-TVio_TLJjCMTHDyJZJjk6s', // 9_2026_AV_Comms
+  '10_2026': '1uIqbSa8g6u81xtd_jbYbuPyGCNG9OcjcHbFtyj9pPVc', // 10_2026_AV_Comms
+  '11_2026': '1QbiK8fjmua3swsFkmGCTeuz4GCZ0cDPNTmBHbBJJ9Hc', // 11_2026_AV_Comms
+  '12_2026': '1IhOhZxoifPu37jpi5Pfd77V3k6MxP0v9RgbH-alI7zA'  // 12_2026_AV_Comms
 };
 
 function fileLabel_(ym) {
@@ -293,9 +302,20 @@ function cleanupSheet_(sheet, ym) {
   var ids = sheet.getRange(2, ID_COL, lastRow - 1, 1).getValues();
   var dates = sheet.getRange(2, DATE_COL, lastRow - 1, 1).getValues();
 
+  // Fast path for Date cells: Utilities.formatDate() per cell took minutes on
+  // a 500k-row file (the 2026-09-24 rebuild of July timed out). Compute the
+  // file's UTC offset once and read month/year with plain Date arithmetic.
+  var offMs = null;
   var wrong = {}, wrongMonth = 0;
   for (var w = 0; w < dates.length; w++) {
-    var k = monthKey_(dates[w][0], tz);
+    var v = dates[w][0], k;
+    if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v)) {
+      if (offMs === null) offMs = tzOffsetMs_(v, tz);
+      var x = new Date(v.getTime() + offMs);
+      k = (x.getUTCMonth() + 1) + '_' + x.getUTCFullYear();
+    } else {
+      k = monthKey_(v, tz);
+    }
     if (k && k !== ym) { wrong[w] = true; wrongMonth++; }
   }
   var lastIndexById = {};
@@ -339,6 +359,13 @@ function cleanupSheet_(sheet, ym) {
     }
   }
   return { duplicates: duplicates, wrongMonth: wrongMonth, total: total };
+}
+
+// "-0500" -> -5h in ms (fixed-offset zones like America/Bogota; no DST).
+function tzOffsetMs_(d, tz) {
+  var z = Utilities.formatDate(d, tz, 'Z');
+  var sign = z.charAt(0) === '-' ? -1 : 1;
+  return sign * (parseInt(z.substr(1, 2), 10) * 60 + parseInt(z.substr(3, 2), 10)) * 60000;
 }
 
 function normalizeWidth_(row) {
